@@ -1909,6 +1909,7 @@ type IndexSignatureParameter =
   | Number
   | Symbol
   | TemplateLiteral
+  | Literal
   | Union<IndexSignatureParameter>
 
 function isIndexSignatureParameterSide(ast: AST): ast is IndexSignatureParameter {
@@ -1917,6 +1918,7 @@ function isIndexSignatureParameterSide(ast: AST): ast is IndexSignatureParameter
     case "Number":
     case "Symbol":
     case "TemplateLiteral":
+    case "Literal":
       return true
     case "Union":
       return ast.types.every(isIndexSignatureParameterSide)

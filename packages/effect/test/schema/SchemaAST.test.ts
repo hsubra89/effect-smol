@@ -318,7 +318,18 @@ describe("SchemaAST", () => {
   describe("IndexSignature", () => {
     it("accepts valid parameters on both type and encoded side", () => {
       doesNotThrow(() => new SchemaAST.IndexSignature(Schema.String.ast, Schema.Number.ast, undefined))
+      doesNotThrow(() => new SchemaAST.IndexSignature(Schema.Literal("a").ast, Schema.Number.ast, undefined))
       doesNotThrow(() => new SchemaAST.IndexSignature(Schema.NumberFromString.ast, Schema.Number.ast, undefined))
+      doesNotThrow(() =>
+        new SchemaAST.IndexSignature(Schema.Number.ast.toCodecStringTree(), Schema.Number.ast, undefined)
+      )
+      doesNotThrow(() =>
+        new SchemaAST.IndexSignature(
+          SchemaAST.flip(Schema.Number.ast.toCodecStringTree()),
+          Schema.Number.ast,
+          undefined
+        )
+      )
       doesNotThrow(() =>
         new SchemaAST.IndexSignature(
           Schema.Union([Schema.String, Schema.NumberFromString]).ast,
@@ -330,8 +341,8 @@ describe("SchemaAST", () => {
 
     it("rejects invalid type side parameters", () => {
       throws(
-        () => new SchemaAST.IndexSignature(Schema.Literal("a").ast, Schema.Number.ast, undefined),
-        new Error("Invalid index signature parameter Literal")
+        () => new SchemaAST.IndexSignature(Schema.Boolean.ast, Schema.Number.ast, undefined),
+        new Error("Invalid index signature parameter Boolean")
       )
     })
 
