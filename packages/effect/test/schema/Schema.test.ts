@@ -3551,6 +3551,19 @@ Expected a value with a size of at most 2, got Map([["a",1],["b",NaN],["c",3]])`
       await encoding.succeed({ a: undefined })
     })
 
+    it("Record(String.check, Number) should use the key checks to select keys", async () => {
+      const schema = Schema.Record(Schema.String.check(Schema.isPattern(/^a/)), Schema.Number)
+      const asserts = new TestSchema.Asserts(schema)
+
+      const decoding = asserts.decoding()
+      await decoding.succeed({ a: 1, ab: 2, b: "ignored" }, { a: 1, ab: 2 })
+      await decoding.fail(
+        { a: "bad", b: 1 },
+        `Expected number, got "bad"
+  at ["a"]`
+      )
+    })
+
     it("Record(Symbol, Number)", async () => {
       const schema = Schema.Record(Schema.Symbol, Schema.Number)
       const asserts = new TestSchema.Asserts(schema)
@@ -3576,6 +3589,24 @@ Expected a value with a size of at most 2, got Map([["a",1],["b",NaN],["c",3]])`
   at [Symbol(a)]`
       )
       await encoding.fail(null, "Expected object, got null")
+    })
+
+    it("Record(Symbol.check, Number) should use the key checks to select keys", async () => {
+      const a = Symbol.for("a")
+      const b = Symbol.for("b")
+      const schema = Schema.Record(
+        Schema.Symbol.check(Schema.makeFilter((symbol) => Symbol.keyFor(symbol)?.startsWith("a") ?? false)),
+        Schema.Number
+      )
+      const asserts = new TestSchema.Asserts(schema)
+
+      const decoding = asserts.decoding()
+      await decoding.succeed({ [a]: 1, [b]: "ignored" }, { [a]: 1 })
+      await decoding.fail(
+        { [a]: "bad", [b]: 1 },
+        `Expected number, got "bad"
+  at [Symbol(a)]`
+      )
     })
 
     it("Record(SnakeToCamel, NumberFromString)", async () => {
@@ -3714,6 +3745,7 @@ Expected a value with a size of at most 2, got Map([["a",1],["b",NaN],["c",3]])`
 
       const decoding = asserts.decoding()
       await decoding.succeed({ 1: "1" }, { "1": 1 })
+      await decoding.succeed({ 1: "1", "1.1": "ignored", Infinity: "ignored", NaN: "ignored" }, { "1": 1 })
       await decoding.fail(
         { 1: null },
         `Expected string, got null
@@ -3724,20 +3756,18 @@ Expected a value with a size of at most 2, got Map([["a",1],["b",NaN],["c",3]])`
         `Expected a finite number, got NaN
   at ["1"]`
       )
+    })
+
+    it("Record(TemplateLiteral with checked part, Number) should use the part checks to select keys", async () => {
+      const schema = Schema.Record(Schema.TemplateLiteral(["a", Schema.NonEmptyString]), Schema.Number)
+      const asserts = new TestSchema.Asserts(schema)
+
+      const decoding = asserts.decoding()
+      await decoding.succeed({ a: "ignored", ab: 1 }, { ab: 1 })
       await decoding.fail(
-        { Infinity: "1" },
-        `Expected a string representing a finite number, got "Infinity"
-  at ["Infinity"]`
-      )
-      await decoding.fail(
-        { NaN: "1" },
-        `Expected a string representing a finite number, got "NaN"
-  at ["NaN"]`
-      )
-      await decoding.fail(
-        { "-Infinity": "1" },
-        `Expected a string representing a finite number, got "-Infinity"
-  at ["-Infinity"]`
+        { a: 1, ab: "bad" },
+        `Expected number, got "bad"
+  at ["ab"]`
       )
     })
 
@@ -5214,62 +5244,6 @@ Expected a value with a size of at most 2, got Map([["a",1],["b",NaN],["c",3]])`
       throws(
         () => Schema.TemplateLiteral([Schema.Union([Schema.Literal("a"), Schema.Literal("b")]).check(check)]),
         "Invalid TemplateLiteral part Union"
-      )
-    })
-
-    it("getTemplateLiteralRegExp", () => {
-      const assertSource = (
-        parts: Schema.TemplateLiteral.Parts,
-        source: string
-      ) => {
-        strictEqual(SchemaAST.getTemplateLiteralRegExp(Schema.TemplateLiteral(parts).ast).source, source)
-      }
-
-      assertSource(["a"], "^(a)$")
-      assertSource(["a", "b"], "^(a)(b)$")
-      assertSource([Schema.Literals(["a", "b"]), "c"], "^(a|b)(c)$")
-      assertSource(
-        [Schema.Literals(["a", "b"]), "c", Schema.Literals(["d", "e"])],
-        "^(a|b)(c)(d|e)$"
-      )
-      assertSource(
-        [Schema.Literals(["a", "b"]), Schema.String, Schema.Literals(["d", "e"])],
-        "^(a|b)([\\s\\S]*?)(d|e)$"
-      )
-      assertSource(["a", Schema.String], "^(a)([\\s\\S]*?)$")
-      assertSource(["a", Schema.String, "b"], "^(a)([\\s\\S]*?)(b)$")
-      assertSource(
-        ["a", Schema.String, "b", Schema.Number],
-        "^(a)([\\s\\S]*?)(b)([+-]?\\d*\\.?\\d+(?:[Ee][+-]?\\d+)?)$"
-      )
-      assertSource(["a", Schema.Number], "^(a)([+-]?\\d*\\.?\\d+(?:[Ee][+-]?\\d+)?)$")
-      assertSource([Schema.String, "a"], "^([\\s\\S]*?)(a)$")
-      assertSource([Schema.Number, "a"], "^([+-]?\\d*\\.?\\d+(?:[Ee][+-]?\\d+)?)(a)$")
-      assertSource(
-        [Schema.Union([Schema.String, Schema.Literal(1)]), Schema.Union([Schema.Number, Schema.Literal("true")])],
-        "^([\\s\\S]*?|1)([+-]?\\d*\\.?\\d+(?:[Ee][+-]?\\d+)?|true)$"
-      )
-      assertSource(
-        [Schema.Union([Schema.Literals(["a", "b"]), Schema.Literals([1, 2])])],
-        "^(a|b|1|2)$"
-      )
-      assertSource(
-        ["c", Schema.Union([Schema.TemplateLiteral(["a", Schema.String, "b"]), Schema.Literal("e")]), "d"],
-        "^(c)(a[\\s\\S]*?b|e)(d)$"
-      )
-      assertSource(
-        ["<", Schema.TemplateLiteral(["h", Schema.Literals([1, 2])]), ">"],
-        "^(<)(h(?:1|2))(>)$"
-      )
-      assertSource(
-        [
-          "-",
-          Schema.Union([
-            Schema.TemplateLiteral(["a", Schema.Literals(["b", "c"])]),
-            Schema.TemplateLiteral(["d", Schema.Literals(["e", "f"])])
-          ])
-        ],
-        "^(-)(a(?:b|c)|d(?:e|f))$"
       )
     })
 

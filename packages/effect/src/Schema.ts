@@ -12852,7 +12852,11 @@ export function toFormatter<T>(schema: Schema<T>, options?: {
           // handle index signatures
           // ---------------------------------------------
           for (let i = 0; i < indexSignatures.length; i++) {
-            const keys = SchemaAST.getIndexSignatureKeys(t, ast.indexSignatures[i].parameter)
+            const keys = SchemaAST.getIndexSignatureKeys(
+              t,
+              ast.indexSignatures[i].parameter,
+              SchemaAST.defaultParseOptions
+            )
             for (const key of keys) {
               if (visited.has(key)) {
                 continue

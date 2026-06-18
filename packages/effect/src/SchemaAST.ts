@@ -25,7 +25,6 @@ import * as InternalSchemaCause from "./internal/schema/cause.ts"
 import * as Option from "./Option.ts"
 import * as Pipeable from "./Pipeable.ts"
 import * as Predicate from "./Predicate.ts"
-import * as RegEx from "./RegExp.ts"
 import * as Result from "./Result.ts"
 import type * as Schema from "./Schema.ts"
 import * as SchemaGetter from "./SchemaGetter.ts"
@@ -1068,9 +1067,8 @@ function isTemplateLiteralPart(ast: AST): ast is TemplateLiteralPart {
     case "BigInt":
       return true
     case "Literal":
-      return ast.checks === undefined
     case "TemplateLiteral":
-      return ast.checks === undefined && ast.encodedParts.every(isTemplateLiteralPart)
+      return ast.checks === undefined
     case "Union":
       return ast.checks === undefined && ast.types.every(isTemplateLiteralPart)
     default:
@@ -1464,6 +1462,10 @@ export class Symbol extends Base {
     return fromRefinement(this, Predicate.isSymbol)
   }
   /** @internal */
+  match(s: symbol, options: ParseOptions): unknown | undefined {
+    return applyTemplateLiteralPartChecks(this, s, options)
+  }
+  /** @internal */
   toCodecStringTree(): AST {
     return replaceEncoding(this, [symbolToString])
   }
@@ -1808,7 +1810,30 @@ const wrapPropertyKeyIssue = (
  */
 export const FINITE_PATTERN = "[+-]?\\d*\\.?\\d+(?:[Ee][+-]?\\d+)?"
 
-const isNumberStringRegExp = new globalThis.RegExp(`(?:${FINITE_PATTERN}|Infinity|-Infinity|NaN)`)
+function getIndexSignatureKeysForParameter(
+  input: { readonly [x: PropertyKey]: unknown },
+  parameter: AST,
+  options: ParseOptions
+): ReadonlyArray<PropertyKey> {
+  switch (parameter._tag) {
+    case "String":
+    case "TemplateLiteral":
+    case "Literal":
+      return Object.keys(input).filter((k) => parameter.match(k, options) !== undefined)
+    case "Number":
+      return Object.keys(input).filter((k) =>
+        parameter.match(k, options) !== undefined ||
+        ((k === "NaN" || k === "Infinity" || k === "-Infinity") &&
+          applyTemplateLiteralPartChecks(parameter, globalThis.Number(k), options) !== undefined)
+      )
+    case "Symbol":
+      return Object.getOwnPropertySymbols(input).filter((k) => parameter.match(k, options) !== undefined)
+    case "Union":
+      return [...new Set(parameter.types.flatMap((t) => getIndexSignatureKeysForParameter(input, t, options)))]
+    default:
+      return []
+  }
+}
 
 /**
  * Returns the object keys that match the index signature parameter schema.
@@ -1816,25 +1841,10 @@ const isNumberStringRegExp = new globalThis.RegExp(`(?:${FINITE_PATTERN}|Infinit
  */
 export function getIndexSignatureKeys(
   input: { readonly [x: PropertyKey]: unknown },
-  parameter: AST
+  parameter: AST,
+  options: ParseOptions
 ): ReadonlyArray<PropertyKey> {
-  const encoded = toEncoded(parameter)
-  switch (encoded._tag) {
-    case "String":
-      return Object.keys(input)
-    case "TemplateLiteral": {
-      const regExp = getTemplateLiteralRegExp(encoded)
-      return Object.keys(input).filter((k) => regExp.test(k))
-    }
-    case "Symbol":
-      return Object.getOwnPropertySymbols(input)
-    case "Number":
-      return Object.keys(input).filter((k) => isNumberStringRegExp.test(k))
-    case "Union":
-      return [...new Set(encoded.types.flatMap((t) => getIndexSignatureKeys(input, t)))]
-    default:
-      return []
-  }
+  return getIndexSignatureKeysForParameter(input, indexSignatureParameterFromString(toEncoded(parameter)), options)
 }
 
 /**
@@ -1894,6 +1904,31 @@ export class KeyValueCombiner {
   }
 }
 
+type IndexSignatureParameter =
+  | String
+  | Number
+  | Symbol
+  | TemplateLiteral
+  | Union<IndexSignatureParameter>
+
+function isIndexSignatureParameterSide(ast: AST): ast is IndexSignatureParameter {
+  switch (ast._tag) {
+    case "String":
+    case "Number":
+    case "Symbol":
+    case "TemplateLiteral":
+      return true
+    case "Union":
+      return ast.types.every(isIndexSignatureParameterSide)
+    default:
+      return false
+  }
+}
+
+function isIndexSignatureParameter(ast: AST): ast is IndexSignatureParameter {
+  return isIndexSignatureParameterSide(ast) && isIndexSignatureParameterSide(toEncoded(ast))
+}
+
 /**
  * Represents an index signature entry within an {@link Objects} node.
  *
@@ -1920,7 +1955,7 @@ export class KeyValueCombiner {
  * @since 3.10.0
  */
 export class IndexSignature {
-  readonly parameter: AST
+  readonly parameter: IndexSignatureParameter
   readonly type: AST
   readonly merge: KeyValueCombiner | undefined
 
@@ -1929,6 +1964,9 @@ export class IndexSignature {
     type: AST,
     merge: KeyValueCombiner | undefined
   ) {
+    if (!isIndexSignatureParameter(parameter)) {
+      throw new Error(`Invalid index signature parameter ${parameter._tag}`)
+    }
     this.parameter = parameter
     this.type = type
     this.merge = merge
@@ -2158,7 +2196,7 @@ export class Objects extends Base {
         const keyPairs = Arr.empty<[PropertyKey, IndexSignature]>()
         for (let i = 0; i < indexCount; i++) {
           const is = ast.indexSignatures[i]
-          const keys = getIndexSignatureKeys(input, is.parameter)
+          const keys = getIndexSignatureKeys(input, is.parameter, options)
           for (let j = 0; j < keys.length; j++) {
             const key = keys[j]
             keyPairs.push([key, is])
@@ -3268,14 +3306,6 @@ function parseParameter(ast: AST): {
         literals: [ast.symbol],
         parameters: []
       }
-    case "String":
-    case "Number":
-    case "Symbol":
-    case "TemplateLiteral":
-      return {
-        literals: [],
-        parameters: [ast]
-      }
     case "Union": {
       const out: {
         literals: ReadonlyArray<PropertyKey>
@@ -3288,8 +3318,12 @@ function parseParameter(ast: AST): {
       }
       return out
     }
+    default:
+      return {
+        literals: [],
+        parameters: [ast]
+      }
   }
-  return { literals: [], parameters: [] }
 }
 
 /** @internal */
@@ -3449,45 +3483,6 @@ export function containsUndefined(ast: AST): boolean {
     default:
       return false
   }
-}
-
-function getTemplateLiteralSource(ast: TemplateLiteral, top: boolean): string {
-  return ast.encodedParts.map((part) =>
-    handleTemplateLiteralASTPartParens(part, getTemplateLiteralASTPartPattern(part), top)
-  ).join("")
-}
-
-/** @internal */
-export const getTemplateLiteralRegExp = memoize((ast: TemplateLiteral): RegExp => {
-  return new globalThis.RegExp(`^${getTemplateLiteralSource(ast, true)}$`)
-})
-
-function getTemplateLiteralASTPartPattern(part: TemplateLiteralPart): string {
-  switch (part._tag) {
-    case "Literal":
-      return RegEx.escape(globalThis.String(part.literal))
-    case "String":
-      return STRING_PATTERN
-    case "Number":
-      return FINITE_PATTERN
-    case "BigInt":
-      return BIGINT_PATTERN
-    case "TemplateLiteral":
-      return getTemplateLiteralSource(part, false)
-    case "Union":
-      return part.types.map(getTemplateLiteralASTPartPattern).join("|")
-  }
-}
-
-function handleTemplateLiteralASTPartParens(part: TemplateLiteralPart, s: string, top: boolean): string {
-  if (isUnion(part)) {
-    if (!top) {
-      return `(?:${s})`
-    }
-  } else if (!top) {
-    return s
-  }
-  return `(${s})`
 }
 
 function fromConst<const T>(
