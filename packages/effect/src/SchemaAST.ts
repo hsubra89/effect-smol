@@ -1066,11 +1066,13 @@ function isTemplateLiteralPart(ast: AST): ast is TemplateLiteralPart {
     case "String":
     case "Number":
     case "BigInt":
-    case "Literal":
-    case "TemplateLiteral":
       return true
+    case "Literal":
+      return ast.checks === undefined
+    case "TemplateLiteral":
+      return ast.checks === undefined && ast.encodedParts.every(isTemplateLiteralPart)
     case "Union":
-      return ast.types.every(isTemplateLiteralPart)
+      return ast.checks === undefined && ast.types.every(isTemplateLiteralPart)
     default:
       return false
   }
@@ -1130,19 +1132,22 @@ export class TemplateLiteral extends Base {
     return "string"
   }
   /** @internal */
+  match(s: string, options: ParseOptions): unknown | undefined {
+    return segmentTemplateLiteralParts(this.encodedParts, s, options) === undefined ? undefined : s
+  }
+  /** @internal */
   asTemplateLiteralParser(): Arrays {
     const tuple = new Arrays(false, this.parts.map(templateLiteralPartFromString), [])
-    const regExp = getTemplateLiteralRegExp(this)
     return decodeTo(
       string,
       tuple,
       new SchemaTransformation.Transformation(
-        SchemaGetter.transformOrFail((s: string) => {
-          const match = regExp.exec(s)
-          if (match) return Effect.succeed(match.slice(1, this.parts.length + 1))
+        SchemaGetter.transformOrFail((s: string, options) => {
+          const segments = segmentTemplateLiteralParts(this.encodedParts, s, options)
+          if (segments !== undefined) return Effect.succeed(segments)
           return Effect.fail(
             new SchemaIssue.InvalidValue(Option.some(s), {
-              message: `Expected a value matching ${regExp.source}, got ${format(s)}`
+              message: `Expected a string matching template literal parts, got ${format(s)}`
             })
           )
         }),
@@ -1248,6 +1253,10 @@ export class Literal extends Base {
     return fromConst(this, this.literal)
   }
   /** @internal */
+  match(s: string, _options: ParseOptions): unknown | undefined {
+    return s === globalThis.String(this.literal) ? this.literal : undefined
+  }
+  /** @internal */
   toCodecJson(): AST {
     return typeof this.literal === "bigint" ? literalToString(this) : this
   }
@@ -1288,6 +1297,10 @@ export class String extends Base {
   /** @internal */
   getParser() {
     return fromRefinement(this, Predicate.isString)
+  }
+  /** @internal */
+  match(s: string, options: ParseOptions): unknown | undefined {
+    return applyTemplateLiteralPartChecks(this, s, options)
   }
   /** @internal */
   getExpected(): string {
@@ -1334,6 +1347,12 @@ export class Number extends Base {
   /** @internal */
   getParser() {
     return fromRefinement(this, Predicate.isNumber)
+  }
+  /** @internal */
+  match(s: string, options: ParseOptions): unknown | undefined {
+    return isStringFiniteRegExp.test(s)
+      ? applyTemplateLiteralPartChecks(this, globalThis.Number(s), options)
+      : undefined
   }
   /** @internal */
   toCodecJson(): AST {
@@ -1492,6 +1511,12 @@ export class BigInt extends Base {
   /** @internal */
   getParser() {
     return fromRefinement(this, Predicate.isBigInt)
+  }
+  /** @internal */
+  match(s: string, options: ParseOptions): unknown | undefined {
+    return isStringBigIntRegExp.test(s)
+      ? applyTemplateLiteralPartChecks(this, globalThis.BigInt(s), options)
+      : undefined
   }
   /** @internal */
   toCodecStringTree(): AST {
@@ -2613,6 +2638,16 @@ export class Union<A extends AST = AST> extends Base {
     return this.rebuild(recur, this.encodingChecks, this.checks)
   }
   /** @internal */
+  match(s: string, options: ParseOptions): unknown | undefined {
+    for (const type of this.types) {
+      if (isTemplateLiteralPart(type)) {
+        const out = type.match(s, options)
+        if (out !== undefined) return out
+      }
+    }
+    return undefined
+  }
+  /** @internal */
   getExpected(getExpected: (ast: AST) => string): string {
     const expected = this.annotations?.expected
     if (typeof expected === "string") return expected
@@ -3482,6 +3517,52 @@ function fromRefinement<T>(
       ? Effect.succeed(oinput)
       : Effect.fail(new SchemaIssue.InvalidType(ast, oinput))
   }
+}
+
+function applyTemplateLiteralPartChecks(ast: AST, value: unknown, options: ParseOptions): unknown | undefined {
+  if (options?.disableChecks || ast.checks === undefined) return value
+  const issues: Array<SchemaIssue.Issue> = []
+  collectIssues(ast.checks, value, issues, ast, options)
+  return issues.length === 0 ? value : undefined
+}
+
+function segmentTemplateLiteralParts(
+  parts: ReadonlyArray<TemplateLiteralPart>,
+  input: string,
+  options: ParseOptions
+): Array<string> | undefined {
+  const out = new Array<string>(parts.length)
+  const failures = new Set<string>()
+  function go(i: number, pos: number): boolean {
+    if (i === parts.length) return pos === input.length
+    const key = `${i}/${pos}`
+    if (failures.has(key)) return false
+    const part = parts[i]
+    if (i === parts.length - 1) {
+      const s = input.slice(pos)
+      if (part.match(s, options) !== undefined) {
+        out[i] = s
+        return true
+      }
+    } else if (part._tag === "Literal") {
+      const s = globalThis.String(part.literal)
+      if (input.startsWith(s, pos) && part.match(s, options) !== undefined && go(i + 1, pos + s.length)) {
+        out[i] = s
+        return true
+      }
+    } else {
+      for (let end = input.length; end >= pos; end--) {
+        const s = input.slice(pos, end)
+        if (part.match(s, options) !== undefined && go(i + 1, end)) {
+          out[i] = s
+          return true
+        }
+      }
+    }
+    failures.add(key)
+    return false
+  }
+  return go(0, 0) ? out : undefined
 }
 
 /** @internal */
