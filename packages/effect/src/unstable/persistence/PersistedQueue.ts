@@ -405,6 +405,10 @@ export const makeStoreRedis = Effect.fnUntraced(function*(
     attempts: number
     lastFailure?: string
   }
+  type ClaimedElement = {
+    readonly value: Element
+    readonly token: string
+  }
 
   const requeue = redis.eval(requeueRedis)
   const complete = redis.eval(completeRedis)
@@ -412,13 +416,13 @@ export const makeStoreRedis = Effect.fnUntraced(function*(
   const resetQueue = redis.eval(resetQueueRedis)
   const offer = redis.eval(offerRedis)
   const take = redis.eval(takeRedis)
-  const expireAll = redis.eval(expireAllRedis)
+  const refreshLocks = redis.eval(refreshLocksRedis)
 
   const queues = yield* RcMap.make({
     lookup: Effect.fnUntraced(function*(name: string) {
       const queueKey = keyQueue(name)
       const pendingKey = keyPending(name)
-      const queue = yield* Queue.make<Element>()
+      const queue = yield* Queue.make<ClaimedElement>()
       const takers = MutableRef.make(0)
       const pollLatch = Latch.makeUnsafe()
       const takenLatch = Latch.makeUnsafe()
@@ -428,13 +432,14 @@ export const makeStoreRedis = Effect.fnUntraced(function*(
           Effect.flatMap(
             Queue.clear(queue),
             (elements) =>
-              Effect.forEach(elements, (element) =>
+              Effect.forEach(elements, (claimed) =>
                 requeue(
                   queueKey,
                   pendingKey,
-                  keyLock(element.id),
-                  element.id,
-                  JSON.stringify(element)
+                  keyLock(claimed.value.id),
+                  claimed.value.id,
+                  JSON.stringify(claimed.value),
+                  claimed.token
                 ), { concurrency: "unbounded", discard: true })
           )
         )
@@ -446,15 +451,26 @@ export const makeStoreRedis = Effect.fnUntraced(function*(
         Effect.forkScoped
       )
 
-      const poll = (size: number) =>
-        take(
-          queueKey,
-          pendingKey,
-          prefix,
-          workerId,
-          size,
-          lockExpirationMillis
+      const poll = (size: number) => {
+        const tokenPrefix = `${workerId}:${crypto.randomUUID()}:`
+        return Effect.map(
+          take(
+            queueKey,
+            pendingKey,
+            prefix,
+            tokenPrefix,
+            size,
+            lockExpirationMillis
+          ),
+          (payloads) =>
+            payloads === null
+              ? null
+              : payloads.map((payload, index) => ({
+                value: JSON.parse(payload),
+                token: `${tokenPrefix}${index + 1}`
+              }))
         )
+      }
 
       yield* Effect.gen(function*() {
         while (true) {
@@ -466,7 +482,7 @@ export const makeStoreRedis = Effect.fnUntraced(function*(
             continue
           }
           takenLatch.closeUnsafe()
-          yield* Queue.offerAll(queue, results.map((json) => JSON.parse(json)))
+          yield* Queue.offerAll(queue, results)
           yield* takenLatch.await
           yield* Effect.yieldNow
         }
@@ -482,12 +498,12 @@ export const makeStoreRedis = Effect.fnUntraced(function*(
     idleTimeToLive: Duration.seconds(30)
   })
 
-  const activeLockKeys = new Set<string>()
+  const activeLocks = new Map<string, string>()
 
   yield* Effect.gen(function*() {
     while (true) {
       yield* Effect.sleep(lockRefreshMillis)
-      yield* Effect.ignore(expireAll(Array.from(activeLockKeys), lockExpirationMillis))
+      yield* Effect.ignore(refreshLocks(Array.from(activeLocks), lockExpirationMillis))
     }
   }).pipe(
     Effect.forkScoped,
@@ -535,12 +551,18 @@ export const makeStoreRedis = Effect.fnUntraced(function*(
               }))
           }),
           Effect.scoped,
-          Effect.tap((element) => {
+          Effect.tap((claimed) => {
+            const element = claimed.value
             const lock = keyLock(element.id)
-            activeLockKeys.add(lock)
+            activeLocks.set(lock, claimed.token)
+            const releaseActiveLock = () => {
+              if (activeLocks.get(lock) === claimed.token) {
+                activeLocks.delete(lock)
+              }
+            }
             return Effect.addFinalizer(Exit.match({
               onFailure: (cause) => {
-                activeLockKeys.delete(lock)
+                releaseActiveLock()
                 const nextAttempts = element.attempts + 1
                 if (nextAttempts >= options.maxAttempts) {
                   return Effect.orDie(failed(
@@ -552,7 +574,8 @@ export const makeStoreRedis = Effect.fnUntraced(function*(
                       ...element,
                       lastFailure: Cause.pretty(cause),
                       attempts: nextAttempts
-                    })
+                    }),
+                    claimed.token
                   ))
                 }
                 return Effect.orDie(requeue(
@@ -568,19 +591,22 @@ export const makeStoreRedis = Effect.fnUntraced(function*(
                         lastFailure: Cause.pretty(cause),
                         attempts: nextAttempts
                       }
-                  )
+                  ),
+                  claimed.token
                 ))
               },
               onSuccess: () => {
-                activeLockKeys.delete(lock)
+                releaseActiveLock()
                 return Effect.orDie(complete(
                   keyPending(options.name),
                   lock,
-                  element.id
+                  element.id,
+                  claimed.token
                 ))
               }
             }))
-          })
+          }),
+          Effect.map((claimed) => claimed.value)
         )
       )
   })
@@ -629,7 +655,9 @@ end
 )
 
 const requeueRedis = Redis.script(
-  (...args: [keyQueue: string, keyPending: string, keyLock: string, id: string, payload: string]) => args,
+  (
+    ...args: [keyQueue: string, keyPending: string, keyLock: string, id: string, payload: string, token: string]
+  ) => args,
   {
     lua: `
 local key_queue = KEYS[1]
@@ -637,32 +665,46 @@ local key_pending = KEYS[2]
 local key_lock = KEYS[3]
 local id = ARGV[1]
 local payload = ARGV[2]
+local token = ARGV[3]
+
+if redis.call("GET", key_lock) ~= token then
+  return 0
+end
 
 redis.call("DEL", key_lock)
 redis.call("HDEL", key_pending, id)
 redis.call("RPUSH", key_queue, payload)
+return 1
 `,
     numberOfKeys: 3
   }
 )
 
 const completeRedis = Redis.script(
-  (...args: [keyPending: string, keyLock: string, id: string]) => args,
+  (...args: [keyPending: string, keyLock: string, id: string, token: string]) => args,
   {
     lua: `
 local key_pending = KEYS[1]
 local key_lock = KEYS[2]
 local id = ARGV[1]
+local token = ARGV[2]
+
+if redis.call("GET", key_lock) ~= token then
+  return 0
+end
 
 redis.call("DEL", key_lock)
 redis.call("HDEL", key_pending, id)
+return 1
 `,
     numberOfKeys: 2
   }
 )
 
 const failedRedis = Redis.script(
-  (...args: [keyPending: string, keyLock: string, keyFailed: string, id: string, payload: string]) => args,
+  (
+    ...args: [keyPending: string, keyLock: string, keyFailed: string, id: string, payload: string, token: string]
+  ) => args,
   {
     lua: `
 local key_pending = KEYS[1]
@@ -670,10 +712,16 @@ local key_lock = KEYS[2]
 local key_failed = KEYS[3]
 local id = ARGV[1]
 local payload = ARGV[2]
+local token = ARGV[3]
+
+if redis.call("GET", key_lock) ~= token then
+  return 0
+end
 
 redis.call("DEL", key_lock)
 redis.call("HDEL", key_pending, id)
 redis.call("RPUSH", key_failed, payload)
+return 1
 `,
     numberOfKeys: 3
   }
@@ -681,14 +729,21 @@ redis.call("RPUSH", key_failed, payload)
 
 const takeRedis = Redis.script(
   (
-    ...args: [keyQueue: string, keyPending: string, prefix: string, workerId: string, batchSize: number, pttl: number]
+    ...args: [
+      keyQueue: string,
+      keyPending: string,
+      prefix: string,
+      tokenPrefix: string,
+      batchSize: number,
+      pttl: number
+    ]
   ) => args,
   {
     lua: `
 local key_queue = KEYS[1]
 local key_pending = KEYS[2]
 local prefix = ARGV[1]
-local worker_id = ARGV[2]
+local token_prefix = ARGV[2]
 local batch_size = tonumber(ARGV[3])
 local pttl = ARGV[4]
 
@@ -700,7 +755,7 @@ end
 for i, payload in ipairs(payloads) do
   local id = cjson.decode(payload).id
   local key_lock = prefix .. id .. ":lock"
-  redis.call("SET", key_lock, worker_id, "PX", pttl)
+  redis.call("SET", key_lock, token_prefix .. i, "PX", pttl)
   redis.call("HSET", key_pending, id, payload)
 end
 
@@ -710,14 +765,20 @@ return payloads
   }
 ).withReturnType<Arr.NonEmptyArray<string> | null>()
 
-const expireAllRedis = Redis.script(
-  (keys: ReadonlyArray<string>, ttl: number) => [...keys, ttl],
+const refreshLocksRedis = Redis.script(
+  (locks: ReadonlyArray<readonly [key: string, token: string]>, ttl: number) => [
+    ...locks.map(([key]) => key),
+    ...locks.map(([, token]) => token),
+    ttl
+  ],
   {
-    numberOfKeys: (keys) => keys.length,
+    numberOfKeys: (locks) => locks.length,
     lua: `
-local ttl = ARGV[1]
+local ttl = ARGV[#KEYS + 1]
 for i, key in ipairs(KEYS) do
-  redis.call("PEXPIRE", key, ttl)
+  if redis.call("GET", key) == ARGV[i] then
+    redis.call("PEXPIRE", key, ttl)
+  end
 end
 `
   }
