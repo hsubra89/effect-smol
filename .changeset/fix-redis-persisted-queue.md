@@ -2,4 +2,4 @@
 "effect": patch
 ---
 
-Fix Redis-backed `PersistedQueue` reset and failed-item handling.
+Fix Redis-backed `PersistedQueue` reset, stale-claim finalization, and failed-item handling.
